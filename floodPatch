@@ -1,0 +1,709 @@
+#!/usr/local/bin/perl
+
+###################################################################
+#   Author : Yanhan Tang
+#   Date : 22 May, 2013
+#   Description: pull checkin with given fix name or manifest file
+###################################################################
+use strict;
+use DBI;
+use LWP::Simple;
+use File::Copy;
+use File::Path;
+use Term::ANSIColor;
+
+# For debug
+our $dbgStop = 1;
+#
+
+our $manifestFile;
+our $checkin;     #like a bug number
+our $release;     #R12/R122/11i
+our $releaseDir;  #dir under mso/msr/msc, required by EBS compilation
+our %releaseDirMap = ( '11i'=>'115', 'R12'=>'120', 'R122'=>'120' );
+our $locationPrefix = 'http://aru.us.oracle.com:8080/ARU/ViewCheckin/download_process/';
+our %releaseMap = (1400=>'11i', 1500=>'R12');
+
+my $startTime = time;
+################################################
+#print "Processing arguments...\n";
+&processArgs;
+
+################################################
+print "Reading manifest file $manifestFile...\n";
+open FILE, $manifestFile or die "Unable to open manifest file $manifestFile: $!\n";
+my @lines = <FILE>;
+die "#No content in manifest file!\n" unless( $#lines >  0 );
+close FILE;
+
+################################################
+# This part is actually not needed when using fix name 
+# and let floodPatch download manifest file itself
+# Donot rely on user input when a manifest file is given
+# Check checkin number and release by ourself
+
+unless( defined $checkin and defined $release)
+{
+    print "Checking checkin and release...\n";
+    for( my $i=0; $i<20; $i++ )
+    {
+        $_ = $lines[$i];
+        #manifest file should begin like  #... checkin : 8305719 release : R12
+        if( /^#.*checkin\s:\s([0-9]+)\srelease\s:\s(R122|R12|11i)/ )
+        {
+            $checkin = $1;
+            $release = $2;
+            $releaseDir = $releaseDirMap{ $release };
+            die "#Unable to recognize release $release\n" unless ( defined $releaseDir );
+            last;
+        }
+    }
+}
+my $hintStr = "This can happen when manifest file was modified or wrong checkin given";
+die "#Unable to get checkin and release from manifest file $manifestFile\n$hintStr\n" unless ( defined $checkin and defined $release and defined $releaseDir );
+#print "Checkin:$checkin  Release:$release\n";
+
+###############################################
+# We donot want all files described in manifest file,
+# we just need part of them!
+print "Processing manifest file content...\n";
+my %dirMap = (mso=>1, msc=>1, msr=>1);
+my %subDirMap = (src=>1, include=>1);
+my $reg1 = '(msc|mso|msr)'; #Only get files in these dirs
+my $reg2 = '(src|include)'; #Only cares these subdirs in top dirs above
+&redDisp("Warning: only files with 1st field matching $reg1 and 2nd field matching $reg2 will be pulled!!\n");
+my $reducedLines = &processManifestFile( \@lines, $reg1, $reg2 );
+
+###############################################
+$checkin =~ /^(\d+)/; # Grasp the heading numbers as patch directory
+die "Unable to grasp heading numbers from string $checkin\n" unless ( defined $1 );
+my $patchDir = $1;
+print "Pulling checkins... Patch will be saved to ";&redDisp($patchDir."\n");
+
+#Clean up previous download
+if( -e $patchDir )
+{
+    print "Removing old downloads...\n";
+    system( "rm -rf $patchDir" );
+}
+
+&redDisp(" Please DONOT try to terminate this process yourself!!!\n" );
+mkdir $patchDir unless ( -e $patchDir );
+chdir $patchDir;
+&pullCheckin( $patchDir, $reducedLines );
+
+###############################################
+# Add 120/115 dir behind msc/msr/mso
+print "Post process for release dir...\n";
+foreach( keys %dirMap ) {
+    chdir $_;
+    mkdir $releaseDir;
+    foreach( keys %subDirMap ) {
+        move($_,$releaseDir.'/'.$_);
+    }
+    chdir '..';
+}
+
+###############################################
+system( 'perl /home/yantang/tools/genQtPro.pl' );
+
+###############################################
+print "\nCopying patch.mk and tnsnames.ora\n";
+chdir '..'; #Suppose previously we are in patchDir
+copy('/home/debzhang/bin/aru/patch.mk', $patchDir ) or die "Unable to copy patch.mk:$!";
+if( $release eq '11i' ) {
+    copy('/home/debzhang/bin/aru/tnsnames.ora.115',$patchDir.'/'.'tnsnames.ora') or die "Unable to copy tnsnames.ora:$!";
+}else{
+    copy('/home/debzhang/bin/aru/tnsnames.ora.121',$patchDir.'/'.'tnsnames.ora') or die "Unable to copy tnsnames.ora:$!";
+}
+
+###############################################
+print "Changing directory permission\n";
+system( 'chmod 755 -R '.$patchDir );
+
+###############################################
+print "Creating zip backup... ";
+&redDisp( "Backup will be saved as patch.zip\n" );
+system( 'zip -q '.'patch.zip'.' -r '.$patchDir ); # Save as patch.zip, as scp sometimes cannot recognize our horrible name
+
+###############################################
+print "Checkin $checkin has been pulled successfully\n";
+
+my $endTime = time;
+my $timeTaken = $endTime - $startTime;
+print "# Time taken = $timeTaken seconds\n";
+
+###############################################
+#                  Functions
+###############################################
+sub usage {
+    print "NOTICE:floodPatch has changed its usage!\n\n";
+    print "Usage1: floodPatch checkinName\n";
+    print "        download manifest file with given checkin name and pull checkins\n";
+    print "        You will be asked to select a checkin when multiple results are found\n";
+    print "        N.B.:Only released checkins are cared in such consideration\n";
+    print "Usage2: floodPatch manifestFileName\n";
+    print "        pull checkins with given manifest file\n";
+    print "Checkin and release info is no longer needed because it can search that in manifest file\n";
+    print "patch will be stored to dir named patch[checkin number]\n";
+    print 'by yanhan.tang@oracle.com'."\n";
+    exit 0;
+}
+
+# Clean up remains of a patch
+# arg0: patch to clean
+sub cleanPatch
+{
+    my $patchName = $_[0];
+    system( "rm -rf $patchName" );
+    system( "rm -rf $patchName.manifest" );
+    system( "rm -rf patch.zip" );
+}
+
+# 1. No args taken, output usage
+# 2. One arg taken, take it as manifest file
+# 3. two args taken, possibly using manifest file+release or patchName+release
+sub processArgs
+{
+    if( $#ARGV eq 1 )
+    {
+        chomp $ARGV[1];
+        if( $ARGV[1] eq 'clean' )
+        {
+            &cleanPatch( $ARGV[0] );
+            exit 0;
+        }
+    }
+        
+    if( $#ARGV ne 0 )
+    {
+        print "Argument error!\n";
+        &usage;
+    }
+    
+    $manifestFile = $ARGV[0];
+    #if( not -e $manifestFile ) 
+    # It treated as a checkin name unless it ends with ".manifest"
+    if( not $manifestFile =~ /\.manifest$/ )
+    {
+        print "Start downloading manifest file... \n";
+        $manifestFile = &downloadManifestFile( $manifestFile, $release );
+        die "Fail to download manifest file" unless ( defined $manifestFile );
+    }else{
+        print "Given manifest file: $manifestFile\n";
+    }
+}
+
+# download manifest file with patch name given
+# param0: fix name
+sub downloadManifestFile
+{
+    my $fixName = $_[0];
+
+    BEGIN {
+    $ENV{'ORACLE_HOME'} =  '/local/db/8.0.6' ;
+    }
+
+    my $sql = <<END ;
+    SELECT 
+        ab.bugfix_name,
+        ab.product_id,
+        ab.release_id,
+        ap.product_abbreviation,
+        ab.released_date,
+		ab.bugfix_id
+    FROM
+        aru_bugfixes ab,
+        aru_products ap
+    WHERE
+            ab.bugfix_name like '$fixName%'
+    AND ab.product_id = ap.product_id
+        ORDER BY ab.released_date
+END
+
+    my $aru = "(DESCRIPTION =(LOAD_BALANCE=off)(FAILOVER=on)(ADDRESS_LIST=(ADDRESS = (PROTOCOL = TCP)(HOST = aarudbp03-vip.us.oracle.com)(PORT = 1551)))(ADDRESS_LIST=(ADDRESS= (PROTOCOL = TCP)(HOST = aarudbp02-vip.us.oracle.com)(PORT = 1551)))(CONNECT_DATA = (SERVER= DEDICATED)(SERVICE_NAME= RURO_APPS.US.ORACLE.COM)))";
+    my $data_src = "dbi:Oracle:$aru"; #@arudb.us.oracle.com:1521' ;
+    my $dbh = DBI->connect($data_src,'nevertellyou','nevertellyou');
+    unless( $dbh )
+    {
+        my $errStr = "Connection Error: $DBI::errstr\n";
+        &reportCritical( $errStr );
+        die $errStr;
+    }
+        
+    my $sth = $dbh->prepare($sql);
+    $sth->execute or die "SQL Error: $DBI::errstr\n";
+
+    my @fixNames;
+    
+    # bugfix_name => [ httpUrl release releasedDate ]
+    my %checkinMap;
+    while (my @row = $sth->fetchrow_array) {
+        my $fixName = $row[0];
+        my $prodId = $row[1];
+        my $releaseId = $row[2];
+        my $prodAbv = $row[3];
+        my $releasedDate = $row[4];
+		my $bugfixId = $row[5];
+		$releasedDate = "Not released" unless ( defined $releasedDate );
+        
+        die "Unrecognized release id: $releaseId\n" unless( exists $releaseMap{ $releaseId } );
+        
+        $release = $releaseMap{ $releaseId };
+        my $httpUrl = $locationPrefix.$fixName.'_'.$release.'_'.$prodAbv.'.manifest?bug='.$fixName.'&release='.$releaseId.'&type=manifest';
+        push @fixNames, $fixName;
+        my @fixInfo;
+        $fixInfo[0] = $httpUrl;
+        $fixInfo[1] = $release;
+        $fixInfo[2] = $releasedDate;
+		$fixInfo[3] = $bugfixId;
+        $checkinMap{ $fixName } = \@fixInfo;
+    }
+
+    die "#No released checkin!\n" if ( $#fixNames <  0 );
+
+    my $index = 0;
+    #More than one fixes are found
+    if( $#fixNames >= 1 )
+    {
+        print "More than one checkins are found in aru DB, please select a checkin to download\n";
+        for( my $i=0; $i<= $#fixNames; $i++ )
+        {
+            my $fixName = $fixNames[$i];
+            print "$i  $fixNames[$i] Release:$checkinMap{$fixName}->[1] ReleaseDate:$checkinMap{$fixName}->[2]\n";
+        }
+        print "Enter a index above (0-$#fixNames):";
+        chomp($index = <STDIN>);
+        
+        die "#You are choosing an invalid checkin!\n" if ( $index lt 0 or $index gt $#fixNames );
+    }
+    $checkin = $fixNames[$index];
+    $release = $checkinMap{$checkin}->[1];
+    $releaseDir = $releaseDirMap{ $release };
+	my $bugfixId = $checkinMap{ $checkin}->[3];
+
+    print "Use checkin:  $checkin Release:$release ReleaseDate:$checkinMap{$checkin}->[2]\n";
+    
+    my $manifestFileUrl = $checkinMap{$checkin}->[0];
+    my $manifestFile = $fixNames[$index].'.manifest';
+    my $status = getstore( $manifestFileUrl, $manifestFile );
+    
+    unless (is_success($status))
+    {
+        my $errStr = "#Error in downloading manifest file:Status:$status on $manifestFileUrl";
+        &reportCritical($errStr);
+        die $errStr;
+    }
+    
+    undef($manifestFile) unless ( -e $manifestFile );
+    
+	$manifestFile = &mergeUpstreamCheckin( $dbh, $bugfixId, $manifestFile, "" );
+    $manifestFile;
+}
+
+# Sometimes we get a patch that has B relationship between upstream path - that means we'll get a 
+# non-complete manifest and unable to get a complete source patch as well.
+# This function tests the manifest file first - if it has less than 800 lines we think it's invalid.
+# Then we will find it's upstream patch and download the manifest file until we get a valid one, and
+# merge the manifest file from upstream to downstream.
+# So this function is RECURSIVE!
+
+# param0: DB handle of aru db
+# param1: Bugfix_id of current patch
+# param2: manifest file to be tested.
+# param3: string for decoration
+# return: manifest file merged.
+sub mergeUpstreamCheckin
+{
+	my $dbHandle = $_[0];
+	my $bugfixId = $_[1];
+	my $downstreamManifest = $_[2];
+	my $decorateStr = $_[3];
+	
+	my $finalManifestFile = $downstreamManifest; #To return
+	
+	open DOWN_MANIFEST, $downstreamManifest or die "mergeUpstreamMannifest: Unable to open $downstreamManifest for reading:$!\n";
+	my @downLines = <DOWN_MANIFEST>;
+	close DOWN_MANIFEST;
+	
+	if( $#downLines < 800 )
+	{
+		if( $decorateStr eq "" )
+		{
+			redDisp("This checkin has a non-include relationship with upstream checkin, seeking for upstream checkin and merge ...\n");
+			print "-----------------\n";
+		}
+		my $sql = <<SQL_END ;
+				SELECT 
+				DISTINCT ab.bugfix_name,
+				ab.product_id,
+				ab.release_id,
+				ap.product_abbreviation,
+				ab.bugfix_id,
+				abr.relation_type
+				FROM 
+				aru_bugfixes ab, 
+				aru_products ap,
+				aru_bugfix_relationships abr 
+				WHERE
+				( abr.relation_type = 611 OR abr.relation_type = 601 )
+				AND
+				abr.bugfix_id= $bugfixId 
+				AND
+				abr.related_bugfix_id=ab.bugfix_id
+				AND
+				ap.product_id = ab.product_id
+SQL_END
+		my $sth = $dbHandle->prepare($sql);
+		$sth->execute or die "SQL Error: $DBI::errstr\n";
+		
+		my %upstreamCheckinMap;
+		while (my @row = $sth->fetchrow_array) {
+			my $fixName = $row[0];
+			my $prodId = $row[1];
+			my $releaseId = $row[2];
+			my $prodAbv = $row[3];
+			my $bugfixId = $row[4];
+			my $relationType = ( $row[5] == 601 )? '[I]' : '[B]';
+        
+			die "Unrecognized release id: $releaseId\n" unless( exists $releaseMap{ $releaseId } );
+			
+			$release = $releaseMap{ $releaseId };
+			my $httpUrl = $locationPrefix.$fixName.'_'.$release.'_'.$prodAbv.'.manifest?bug='.$fixName.'&release='.$releaseId.'&type=manifest';
+			my @fixInfo;
+			$fixInfo[0] = $httpUrl;
+			$fixInfo[1] = $bugfixId;
+			$fixInfo[2] = $fixName;
+			$fixInfo[3] = $relationType;
+			$upstreamCheckinMap{ $fixName } = \@fixInfo;
+		}
+		
+		foreach my $fixName ( keys %upstreamCheckinMap )
+		{
+			my $fixInfo = $upstreamCheckinMap{ $fixName };
+			my $manifestFileUrl = $fixInfo->[0];
+			my $manifestFile = $fixName.'.manifest';
+			my $status = getstore( $manifestFileUrl, $manifestFile );
+			
+			unless (is_success($status))
+			{
+				my $errStr = "#Error in downloading manifest file:Status:$status on $manifestFileUrl";
+				&reportCritical($errStr);
+				die $errStr;
+			}
+			
+			print "$decorateStr|\n";
+			print "$decorateStr--$fixInfo->[3] $fixName\n";
+			
+			my $mergedUpstreamManifest = mergeUpstreamCheckin( $dbHandle, $fixInfo->[1], $manifestFile, $decorateStr."  " );
+			
+			$finalManifestFile = mergeManifestFile( $mergedUpstreamManifest, $finalManifestFile );
+		}
+	}
+	
+	$finalManifestFile;
+}
+
+# Merge two manifest file, and set the header to the higher one.
+# param0: manifest file 1
+# param1: manifest file 2
+# return: file name of the new manifest file.
+sub mergeManifestFile
+{
+	my $fileA = $_[0];
+	my $fileB = $_[1];
+	
+	open FA, $fileA or die "mergeManifestFile: Unable to open $fileA for reading:$!\n";
+	open FB, $fileB or die "mergeManifestFile: Unable to open $fileB for reading:$!\n";
+	
+	my $checkinA;
+	my $checkinB;
+	
+	my %versionsA;
+	my %versionsB;
+	
+	my $release ="";
+	while( <FA> )
+	{
+		chomp;
+		if( /^#.*checkin : (\d+) release : (.*)$/ )
+		{
+			$checkinA = $1;
+			$release = $2;
+		}
+		
+		if( /(.*)\s([0-9.]+)/ )
+		{
+			$versionsA{ $1 } = $2;
+		}
+	}
+	close FA;
+	
+	while( <FB> )
+	{
+		chomp;
+		if( /^#.*checkin : (\d+)/ )
+		{
+			$checkinB = $1;
+		}
+		
+		if( /(.*)\s([0-9.]+)/ )
+		{
+			$versionsB{ $1 } = $2;
+		}
+	}
+	close FB;
+	
+	my %versionsMap = %versionsA;
+	
+	foreach my $key ( keys %versionsB )
+	{
+		if( not exists $versionsMap{ $key } )
+		{
+			$versionsMap{ $key } = $versionsB{ $key };
+		}else{
+			$versionsMap{ $key } =~ /\.(\d+)$/;
+			my $version = $1;
+			$versionsB{ $key } =~ /\.(\d+)$/;
+			my $versionB = $1;
+			
+			if( $versionB > $version )
+			{
+				$versionsMap{ $key } = $versionsB{ $key };
+			}
+		}
+	}
+	
+	my $maxCheckin = ($checkinA > $checkinB) ? $checkinA : $checkinB;
+	
+	open FM, '>merged.manifest' or die "mergeManifestFile: Unable to open merged.manifest for writing:$!\n";
+	
+	print FM "# File Manifest for checkin : $maxCheckin release : $release\n";
+	print FM "# This is a merged manifest file generated by floodPatch\n";
+	print FM "# Merged $checkinA and $checkinB\n";
+	
+	foreach my $key ( keys %versionsMap )
+	{
+		print FM "$key $versionsMap{ $key }\n";
+	}
+	close FM;
+	
+	'merged.manifest';
+}
+
+# param0: array ref containing lines of manifest file
+# param1: regular exp for first field in manifest file
+# param2: regular exp for second field in manifest file
+# return: a 2D array containing splitted fields of wanted files
+sub processManifestFile
+{
+    my $array = $_[0];
+    my $reg1 = $_[1];
+    my $reg2 = $_[2];
+    
+    my @reducedLines;
+    #print "##Originally there are $#$array lines \n";
+    
+    foreach my $line (@$array)
+    {
+        chomp $line;
+        next unless ( $line =~ /$reg1/ );
+        my @array = split( /\s+/, $line );
+        my $fields = \@array;
+        #print "#0: $fields->[0] #1: $fields->[1]\n";
+        if( $fields->[0] =~ /$reg1/ and $fields->[1] =~ /$reg2/ )
+        {
+            push @reducedLines, $fields;
+            #print "#Push $line\n";
+        }
+    }
+	
+	my $hintStr = "This can happen when this patch or its upstream patch has a wrong relationship with base patch or wrong checkin given";
+    die "#Manifest file invalid:manifest file not complete.\n$hintStr\n" unless( $#reducedLines > 800 ); #This check also ensures no divide 0 error
+
+    \@reducedLines;
+}
+
+# pull checkin to given file
+# param0: dir to put our patch.
+# param1: a 2D array ref containing splitted fields of wanted files
+sub pullCheckin
+{
+    my $patchDir = $_[0];
+    my $linesNeeded = $_[1];
+    
+    my $totalCount = $#$linesNeeded+1;
+    my @progress;
+    
+    my $filestoreLocation = '/rh2.1AS/nfs/net/adcnas437/export/aruprd5/arubackup/filestore/SOURCE';
+    $filestoreLocation = $filestoreLocation.'/'.$release;
+    
+    die "#Unable to access $filestoreLocation. Please try the script on another machine. Good luck." unless  ( -e $filestoreLocation );
+        
+    my %dirMap; # record directories created, to avoid frequent system call
+    
+    print "Totally $totalCount files will be pulled\n";
+    
+    # Simplify cpuNum * K = BestProcessNum. for the time being, K=5, for commonly seen core-4 machines
+    my $maxChildProcess = 20;
+    my $child = 0;
+    my $pid = -1;
+    
+    for( ; $child<$maxChildProcess; $child++ )
+    {
+        $pid = fork;
+        last unless ( $pid ); # Quit if this is a child
+    }
+    
+    # It's a little dangerous for parent to do the same job as child, so just let it wait
+    if( $pid == 0 )
+    {
+        my $validateFirstFile = 0;
+        my $idx_symbol = 0; #For progress report
+        my $processStart = time;
+        for ( my $lineCount=$child; $lineCount< $totalCount; $lineCount+=$maxChildProcess )
+        {
+                my $fields = $linesNeeded->[$lineCount];
+                #progress report
+                my @progress_symbol = ('-','\\','|','/');
+                if( $child == 0 ) #Only report progress of child process 1
+                {
+                    my $processTimeElapsed = time - $processStart;
+                    my $pos = int(($lineCount/$totalCount)*100); # Reduce output
+                    my $remainTimeStr = estimateRemain( $processTimeElapsed, $pos, 100 );
+                    if( not defined $progress[$pos] ) {
+                            #print $pos." .";
+                            print "\r $progress_symbol[$idx_symbol] $pos% $remainTimeStr";
+                            $idx_symbol = ($idx_symbol>=3)?0:$idx_symbol+1;
+                            select(undef,undef,undef,0.1);
+                            $progress[$pos]=$pos;
+                    }
+                }
+                
+                my $topDir = $fields->[0];
+                my $subDir = $fields->[1];
+                my $fileName = $fields->[2];
+                my $version = $fields->[3];
+                
+                my $dstDir = $topDir.'/'.$subDir;
+                if( not -e $dstDir )
+                {
+                        mkpath($dstDir,0,0755);
+                        $dirMap{$dstDir} = 1;
+                }
+                
+                my $srcZipName = $filestoreLocation.'/'.$topDir.'/'.$subDir.'/'.$fileName.'/'.$version.'.zip';
+                #unzip $srcZipName => $dstDir.'/'.$fileName or die "#$child Fail to unzip $fileName:$!\n";
+                my $command = "unzip -o -q ".$srcZipName.' -d '.$dstDir;
+                
+                system($command);
+                
+                if( not -e $dstDir.'/'.$fileName )
+                {
+                        my $errStr = "#Fail to unzip $fileName. Terminate because of this error \n";
+                        print STDERR $errStr;
+                        die "\n#$child floodPatch terminated. Please check whether you got the right input\n";
+                }
+                
+                # Check file version for the first file.
+                # Should not do this on all files 'cause it consumes lot time.
+                unless( $validateFirstFile )
+                {
+                        &validateFileVersion( $dstDir.'/'.$fileName, $version );
+                        $validateFirstFile = 1;
+                }
+            }
+        }
+        
+        if( $pid == 0 ) { exit 0; } # Child should exit here
+        # Wait for child
+        while( wait != -1 ){};
+        print "  --All childs finished.\n";
+}
+
+# param0: file location
+# param1: file version
+# return: die if not match
+sub validateFileVersion
+{
+    my $fileName = $_[0];
+    my $version  = $_[1];
+    my $fileVersion;
+    
+    unless ( open IDENT_PIPE, "-|" )
+    {
+        exec "ident $fileName";
+        exit;
+    }
+
+    while ( <IDENT_PIPE> )
+    {
+        chomp;
+        if( /\s([0-9.]+)\s/ )
+        {
+            $fileVersion = $1;
+        }
+    }
+
+    close IDENT_PIPE;
+    unless ( $version eq $fileVersion )
+    {
+        my $errStr = "File version donot match in $fileName. Expect $version, Got $fileVersion\n";
+        &reportCritical($errStr);
+        die $errStr;
+    }
+}
+
+# brief: send a mail to me when critical errors are observed
+#        these errors should indicate that I need to update my script
+#        This is only supported on Linux machines
+# param0: content
+sub reportCritical
+{
+    my $mailAddr = 'yanhan.tang@oracle.com';
+    my $subject  = '#floodPatch Error Report#';
+    my $content  = $_[0];
+    
+    print "\n################ Error Report ##################\n";
+    print "#Sending mail to author to report this critical issue...\n";
+    my $command = 'echo "'.$content.'" | mail -s "'.$subject.'" '.$mailAddr;
+    system( $command );
+    print "#Error Report complete!\n";
+}
+
+sub redDisp{
+    my $message = $_[0];
+    print color "bold red";
+    print "$message";
+    print color 'reset';
+}
+
+sub proc_bar{
+     local $| = 1;
+     my $i = $_[0] || return 0;
+     my $n = $_[1] || return 0;
+     print "\r [ ".("\002" x int(($i/$n)*50)).(" " x (50 - int(($i/$n)*50)))." ] ";
+     printf("%2.1f %%",$i/$n*100);
+     local $| = 0;
+}
+
+# p0: time elapsed, count by seconds
+# p1: amount done
+# p2: total amount of the work
+# return: Remain time count by seconds, in the format of min:sec
+sub estimateRemain
+{
+    my $timeElapsed = $_[0];
+    my $doneAmount = $_[1];
+    my $totalAmount = $_[2];
+
+    return "" if( $timeElapsed <= 0 );
+
+    my $timeRemain = $timeElapsed * ( $totalAmount - $doneAmount) / $doneAmount;
+
+    my $min = $timeRemain / 60;
+    my $sec = $timeRemain  % 60;
+
+    my $timeStr = sprintf( "%02d:%02d", $min, $sec );
+}
+

@@ -1,0 +1,42 @@
+#!/usr/bin/perl
+#Caution: The following program doesnot provide ANY WARRANTY for commercial usage.
+#The author will not be responsible for any problems you encountered 
+sub help{
+	print "Usage:\n";
+	print "1. ./dateConvert year month day\n";
+	print "   Example: 2012 7 31\n";
+	print "2. ./dateConvert julianDay\n";
+	print "   Example: 2552332\n";
+}
+die &help if( not($#ARGV ==0 or $#ARGV==2));
+if($#ARGV ==0) {
+    @monthName = qw/Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec/;
+
+    @weekdayName = qw/Mon Tue Wed Thu Fri Sat Sun/;
+
+    $dateNr =$ARGV[0];
+    $l    = $dateNr + 68569;
+    $n    = int( ( 4 * $l ) / 146097              );
+    $l    = int( $l - ( 146097 * $n + 3 ) / 4     );
+    $i    = int( ( 4000 * ( $l + 1 ) ) / 1461001  );
+    $l    = int( $l - int(( 1461 * $i ) / 4) + 31 );
+    $j    = int( ( 80 * $l ) / 2447               );
+    $day  = int( $l - int(( 2447 * $j ) / 80)     );
+    $l    = int( $j / 11                          );
+    $month= int( $j + 2 - ( 12 * $l )             );
+    $year = 100 * ( $n - 49 ) + $i + $l;
+
+    $dayOfWeek = $dateNr % 7;  
+	print "$weekdayName[$dayOfWeek]-$day-$monthName[$month-1]-$year\n\n";
+}else {
+	$year =$ARGV[0];
+	$month=$ARGV[1];
+	$day  =$ARGV[2];
+	
+	$a =int( (14-$month)/12);
+	$y =int( $year+4800-$a);
+	$m =int( $month+12*$a-3);
+	
+	$JDN = $day + int(($m*153+2)/5) +365*$y + int($y/4) -int($y/100) + int($y/400)-32045;
+	print "$JDN";
+}
